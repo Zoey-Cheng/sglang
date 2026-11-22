@@ -286,6 +286,11 @@ class BaseBreakableCudaGraphRunner:
             raise AttributeError(name) from e
         return getattr(transformer, name)
 
+    @property
+    def disabled(self) -> bool:
+        """True once graphs are permanently disabled; callers skip graph-only prep."""
+        return self._disabled_reason is not None
+
     # ------------------------------------------------------------------ #
     # Public capture / replay API
     # ------------------------------------------------------------------ #

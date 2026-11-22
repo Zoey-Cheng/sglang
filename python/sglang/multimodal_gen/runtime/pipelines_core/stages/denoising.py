@@ -2537,6 +2537,10 @@ class DenoisingStage(PipelineStage):
         captured. Serving just replays (or runs eager for an uncaptured
         signature, never capturing).
         """
+        if runner.disabled:
+            # Bucket padding only serves graph signatures; with graphs
+            # permanently disabled, run the bare model on the caller's kwargs.
+            return current_model(**call_kwargs)
         if self._bcg_is_warmup():
             for bucket in self._bcg_text_buckets():
                 runner.capture(

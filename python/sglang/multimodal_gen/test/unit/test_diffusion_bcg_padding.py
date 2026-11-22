@@ -998,6 +998,25 @@ class TestBCGWeightChangeAfterCapture(unittest.TestCase):
         self.worker.resume_memory_occupation()
         self._assert_runs_eager()
 
+    def test_disabled_runner_skips_bucket_padding(self):
+        """After a weight change disabled the graphs, every step still paid
+        bucket padding and ran the model on padded rows; a disabled runner
+        must get the caller's kwargs untouched."""
+        self.runner.reset(disabled_reason="weights changed after capture")
+        stage = self.worker.pipeline.stages[0]
+        seen = {}
+
+        def bare_model(**kwargs):
+            seen.update(kwargs)
+            return "bare"
+
+        with patch.object(DenoisingStage, "_bcg_pad_prompt_kwargs") as pad:
+            out = stage._bcg_run(self.runner, dict(self.kwargs), bare_model)
+
+        self.assertEqual(out, "bare")
+        pad.assert_not_called()
+        self.assertIs(seen["hidden_states"], self.kwargs["hidden_states"])
+
 
 if __name__ == "__main__":
     unittest.main()
