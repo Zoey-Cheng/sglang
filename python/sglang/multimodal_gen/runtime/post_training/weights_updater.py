@@ -372,7 +372,6 @@ class WeightsUpdater:
         target_modules: list[str] | None = None,
     ) -> tuple[bool, str]:
         """Update model weights from disk without restarting the server."""
-        invalidate_conditioning_caches()
         logger.info(f"Updating weights from disk: {model_path}")
 
         try:
@@ -389,6 +388,10 @@ class WeightsUpdater:
             )
             logger.error(error_msg)
             return False, error_msg
+
+        # Invalidate before any mutation, scoped to the modules being updated;
+        # unrelated encoder caches stay warm.
+        invalidate_conditioning_caches(module for _, module in modules_to_update)
 
         try:
             local_model_path = maybe_download_model(model_path)
@@ -535,7 +538,6 @@ class WeightsUpdater:
         lora_alpha: int | None = None,
         lora_rank: int | None = None,
     ) -> tuple[bool, str]:
-        invalidate_conditioning_caches()
         if weight_update_mode == LORA_MERGE_WEIGHT_UPDATE_MODE:
             return self._update_lora_from_tensor(
                 named_tensors=named_tensors,
@@ -561,6 +563,10 @@ class WeightsUpdater:
             )
             logger.error(error_msg)
             return False, error_msg
+
+        # Same invariant as the disk path: invalidate before any mutation,
+        # scoped to the modules being updated.
+        invalidate_conditioning_caches(module for _, module in modules_to_update)
 
         try:
             module_payloads = self._resolve_module_payloads(
@@ -643,6 +649,10 @@ class WeightsUpdater:
         except ValueError as e:
             logger.error(str(e))
             return False, str(e)
+
+        # LoRA IPC only mutates this DiT; its cache entries go, encoder
+        # caches stay warm across every RL weight sync.
+        invalidate_conditioning_caches(module for _, module in modules_to_update)
 
         try:
             module_payloads = self._resolve_module_payloads(

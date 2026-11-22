@@ -416,6 +416,52 @@ def test_scoped_invalidation_preserves_independent_encoders_and_shared_weights()
 
 
 @torch.no_grad()
+def test_tensor_weight_update_keeps_unrelated_encoder_caches():
+    """An RL weight sync that updates only the DiT used to clear every
+    conditioning cache; entries owned by untouched encoders must stay warm."""
+    from unittest.mock import patch
+
+    from sglang.multimodal_gen.runtime.post_training.weights_updater import (
+        WeightsUpdater,
+    )
+
+    cache = ConditioningCache(1024)
+    encoder = Encoder().eval()
+    updated = Encoder().eval()
+    dit = torch.nn.ModuleList([updated])
+    updater = WeightsUpdater.__new__(WeightsUpdater)
+    x = torch.ones(4)
+    with cache.scope():
+        encoder(x)
+        updated(x)
+        with (
+            patch.object(
+                WeightsUpdater,
+                "_collect_modules",
+                return_value=[("transformer", dit)],
+            ),
+            patch.object(
+                WeightsUpdater,
+                "_resolve_module_payloads",
+                return_value={"transformer": object()},
+            ),
+            patch.object(
+                WeightsUpdater, "_materialize_weights_iter", return_value=iter(())
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.post_training.weights_updater."
+                "_load_weights_into_module"
+            ),
+        ):
+            success, _message = updater.update_weights_from_tensor(named_tensors=[])
+        assert success
+        assert torch.equal(encoder(x).last_hidden_state, x)
+        assert torch.equal(updated(x).last_hidden_state, x)
+    # The untouched encoder's entry survived; the updated DiT's was dropped.
+    assert (encoder.calls, updated.calls) == (1, 2)
+
+
+@torch.no_grad()
 def test_negative_conditioning_survives_positive_capacity_pressure():
     model = Encoder().eval()
     # only one entry fits, reproducing two LTX embeddings in the host budget
