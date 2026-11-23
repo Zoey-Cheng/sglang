@@ -7,6 +7,9 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders import (
+    qwen_image as qwen_padder,
+)
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders import (
     qwen_image21 as qwen21_padder,
 )
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
@@ -1016,6 +1019,61 @@ class TestBCGWeightChangeAfterCapture(unittest.TestCase):
         self.assertEqual(out, "bare")
         pad.assert_not_called()
         self.assertIs(seen["hidden_states"], self.kwargs["hidden_states"])
+
+
+class _QwenImageTransformer2DModel:
+    pass
+
+
+class TestQwenPadderTailCu(unittest.TestCase):
+    def _pad(self, batch: int, seq: int, txt_seq_lens):
+        return qwen_padder.pad_qwen_prompt_kwargs(
+            {
+                "encoder_hidden_states": torch.randn(batch, seq, 4),
+                "txt_seq_lens": txt_seq_lens,
+                "freqs_cis": None,
+            },
+            _QwenImageTransformer2DModel(),
+            buckets=(8, 16),
+        )
+
+    def test_single_row_exact_length_emits_cu(self):
+        out = self._pad(1, 5, [5])
+        cu = out.get("txt_bucket_tail_cu")
+        self.assertIsNotNone(cu)
+        self.assertEqual(cu.dtype, torch.int32)
+        self.assertEqual(int(cu[0]), 5)
+        self.assertIsNone(out["txt_seq_lens"])
+        self.assertEqual(out["encoder_hidden_states"].shape[1], 8)
+
+    def test_prepadded_text_keeps_mask_route(self):
+        # seq 8 with valid length 5: the replay would clamp rows the miss
+        # path attends, so no cu is emitted and the mask stays authoritative.
+        out = self._pad(1, 8, [5])
+        self.assertNotIn("txt_bucket_tail_cu", out)
+
+    def test_batched_rows_keep_mask_route(self):
+        out = self._pad(2, 5, [5])
+        self.assertNotIn("txt_bucket_tail_cu", out)
+        out = self._pad(1, 5, [5, 5])
+        self.assertNotIn("txt_bucket_tail_cu", out)
+
+    def test_caller_mask_keeps_mask_route(self):
+        # A caller mask may carry interior holes the length cannot express,
+        # so only the padder-synthesized mask opts into the cu route.
+        mask = torch.ones(1, 5, dtype=torch.bool)
+        mask[0, 2] = False
+        out = qwen_padder.pad_qwen_prompt_kwargs(
+            {
+                "encoder_hidden_states": torch.randn(1, 5, 4),
+                "encoder_hidden_states_mask": mask,
+                "txt_seq_lens": [5],
+                "freqs_cis": None,
+            },
+            _QwenImageTransformer2DModel(),
+            buckets=(8, 16),
+        )
+        self.assertNotIn("txt_bucket_tail_cu", out)
 
 
 if __name__ == "__main__":

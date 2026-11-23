@@ -950,6 +950,9 @@ class QwenImageCrossAttention(nn.Module):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            # The joint mask is bucket-padded to a static shape, so dense
+            # SDPA attention can be captured into the BCG graph.
+            capture_dense_attention=True,
             supported_attention_backends={
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.AITER,
@@ -1009,13 +1012,16 @@ class QwenImageCrossAttention(nn.Module):
         # When the text stream is sharded across SP ranks the joint sequence is
         # fully sequence-parallel, so no leading tokens are replicated.
         sp_text_sharded = cross_attention_kwargs.get("sp_text_sharded", False)
+        # [image, text-bucket] join for the static no-pack varlen path; the
+        # bucket's tail pad becomes a joint suffix clamped by cu_seqlens VALUES.
+        txt_tail_join = cross_attention_kwargs.get("txt_tail_join", False)
         # Rows of tail padding inside THIS rank's text chunk (sp_shard meta).
         sp_txt_pad = _attn_mask_meta_local_pad(attn_mask_meta)
 
         # Joint [text, image] destination buffers take precedence over the
         # packed added-QKV GEMM, which in turn precedes per-layer projections.
         joint_qkv_bufs = None
-        if _use_joint_qkv_buffers(
+        if not txt_tail_join and _use_joint_qkv_buffers(
             attn=self,
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
@@ -1119,6 +1125,9 @@ class QwenImageCrossAttention(nn.Module):
             # Its prefix tensors must go through the ordinary normalization.
             and attn_mask is None
             and encoder_hidden_states_mask is None
+            # The fused epilogue emits [text, image]; the tail-join path needs
+            # [image, text] so the bucket pad stays a joint suffix.
+            and not txt_tail_join
         ):
             joint_qkv = try_fused_qwen_qkv_epilogue(
                 img_query,
@@ -1180,7 +1189,13 @@ class QwenImageCrossAttention(nn.Module):
 
         # Joint order [text, image]; join_seqs relocates any SP text tail-pad
         # behind the image (see sp_shard.join_seqs for why).
-        if attn_mask is None and encoder_hidden_states_mask is not None:
+        # The tail-join path clamps the pad by cu_seqlens VALUES; deriving a
+        # dense mask here would trip the no-mask contract of that path.
+        if (
+            attn_mask is None
+            and encoder_hidden_states_mask is not None
+            and not txt_tail_join
+        ):
             image_mask = torch.ones(
                 (hidden_states.shape[0], img_query.shape[1]),
                 device=encoder_hidden_states_mask.device,
@@ -1190,6 +1205,25 @@ class QwenImageCrossAttention(nn.Module):
                 [encoder_hidden_states_mask.to(dtype=torch.bool), image_mask],
                 dim=1,
             )
+
+        # Under single-rank BCG on SDPA-family backends the dense joint tensors
+        # must be materialized: the captured dense attention cannot run the
+        # break point's segment packing. FA and multi-rank BCG keep the
+        # segmented break points.
+        pack_from_segments = (
+            attn_mask is not None
+            and not sp_text_sharded
+            and not (
+                is_in_breakable_cuda_graph()
+                and get_sp_world_size() == 1
+                and self.attn.backend
+                in (
+                    AttentionBackendEnum.TORCH_SDPA,
+                    AttentionBackendEnum.TORCH_CUDNN_SDPA,
+                    AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
+                )
+            )
+        )
 
         seg_qkv = None
         # The segmented pre-all-to-all emits Ulysses layout; K/V-gather takes
@@ -1223,7 +1257,11 @@ class QwenImageCrossAttention(nn.Module):
             _sync_into_buffer(value=img_key, buf_view=joint_key[:, seq_len_txt:])
             _sync_into_buffer(value=txt_query, buf_view=joint_query[:, :seq_len_txt])
             _sync_into_buffer(value=txt_key, buf_view=joint_key[:, :seq_len_txt])
-        elif attn_mask is not None and not sp_text_sharded:
+        elif txt_tail_join:
+            joint_query = torch.cat([img_query, txt_query], dim=1)
+            joint_key = torch.cat([img_key, txt_key], dim=1)
+            joint_value = torch.cat([img_value, txt_value], dim=1)
+        elif pack_from_segments:
             # Let the eager attention break point pack directly from the text
             # and image segments. Materializing three dense joint tensors here
             # only to gather their valid rows again wastes one launch per Q/K/V.
@@ -1240,17 +1278,13 @@ class QwenImageCrossAttention(nn.Module):
             joint_value,
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
-            num_replicated_prefix=0 if sp_text_sharded else seq_len_txt,
+            num_replicated_prefix=(
+                0 if sp_text_sharded or txt_tail_join else seq_len_txt
+            ),
             qkv_pre_all_to_all=seg_qkv is not None,
-            q_prefix=(
-                txt_query if attn_mask is not None and not sp_text_sharded else None
-            ),
-            k_prefix=(
-                txt_key if attn_mask is not None and not sp_text_sharded else None
-            ),
-            v_prefix=(
-                txt_value if attn_mask is not None and not sp_text_sharded else None
-            ),
+            q_prefix=txt_query if pack_from_segments else None,
+            k_prefix=txt_key if pack_from_segments else None,
+            v_prefix=txt_value if pack_from_segments else None,
         )
 
         # Reshape back
@@ -1258,9 +1292,16 @@ class QwenImageCrossAttention(nn.Module):
         joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
 
         # Split attention outputs back
-        txt_attn_output, img_attn_output = split_seqs(
-            joint_hidden_states, seq_len_txt, sp_txt_pad
-        )
+        if txt_tail_join:
+            # [image, text-bucket] order; the text tail pad rows carry garbage
+            # from the no-pack attention and are dropped by the caller's mask.
+            img_len = joint_hidden_states.shape[1] - seq_len_txt
+            img_attn_output = joint_hidden_states[:, :img_len]
+            txt_attn_output = joint_hidden_states[:, img_len:]
+        else:
+            txt_attn_output, img_attn_output = split_seqs(
+                joint_hidden_states, seq_len_txt, sp_txt_pad
+            )
 
         # Apply output projections
         img_attn_output, img_attn_bias = self.to_out[0](img_attn_output)
@@ -2398,6 +2439,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         freqs_complex: tuple[torch.Tensor, torch.Tensor] = None,
         additional_t_cond: Optional[torch.Tensor] = None,
         guidance: torch.Tensor = None,
+        txt_bucket_tail_cu: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         controlnet_block_samples=None,
         return_dict: bool = True,
@@ -2461,7 +2503,21 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         block_attention_kwargs = attention_kwargs.copy() if attention_kwargs else {}
         sp_text_sharded = False
-        if encoder_hidden_states_mask is not None:
+        if (
+            txt_bucket_tail_cu is not None
+            and is_in_breakable_cuda_graph()
+            and get_sp_world_size() == 1
+        ):
+            # Bucketed single-request path for whole-forward capture: the text
+            # buffer is padded to a fixed bucket, blocks join the sequence as
+            # [image, text] so the pad is a joint-tail suffix, and attention
+            # clamps it via cu_seqlens VALUES -- every shape stays static, so
+            # the forward is capturable and needs no nonzero()-based metadata.
+            joint_len = txt_bucket_tail_cu.to(torch.int32) + hidden_states.shape[1]
+            joint_cu = torch.cat([torch.zeros_like(joint_len), joint_len]).contiguous()
+            block_attention_kwargs["attn_mask_meta"] = {"static_no_pack_cu": joint_cu}
+            block_attention_kwargs["txt_tail_join"] = True
+        elif encoder_hidden_states_mask is not None:
             encoder_hidden_states_mask = encoder_hidden_states_mask.to(
                 device=hidden_states.device, dtype=torch.bool
             )
@@ -2478,6 +2534,8 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 # lengths can share a graph. Attention break kwargs are captured
                 # once, so build varlen metadata replay-locally from the current
                 # static mask instead of closing over stale cu_seqlens/indices.
+                # SDPA-family backends drop this meta at the attention wrapper
+                # and capture the dense mask directly.
                 block_attention_kwargs["attn_mask_meta"] = DynamicVarlenMaskMeta()
             elif (
                 txt_seq_lens is not None

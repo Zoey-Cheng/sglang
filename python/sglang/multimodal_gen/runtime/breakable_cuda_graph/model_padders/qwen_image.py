@@ -91,6 +91,29 @@ def pad_qwen_prompt_kwargs(
             )
             out[key] = type(freqs)((img_cache, txt_cache))
 
+    raw_txt_lens = call_kwargs.get("txt_seq_lens")
+    if (
+        isinstance(raw_txt_lens, (list, tuple))
+        and len(raw_txt_lens) == 1
+        and ehs_tensor.shape[0] == 1
+        # A caller-supplied mask may carry interior holes the length cannot
+        # express; only the mask this padder synthesizes from the length is
+        # guaranteed to be a contiguous valid prefix.
+        and call_kwargs.get("encoder_hidden_states_mask") is None
+        # A caller-prepadded text buffer (seq > valid length) must keep the
+        # mask route: the cu value would exclude rows the miss path attends.
+        and int(raw_txt_lens[0]) == seq
+        and bcg_utils.transformer_class_name_matches(
+            current_model, "qwenimagetransformer2d"
+        )
+    ):
+        # Carry the valid text length as a device VALUE: the forward then
+        # stays shape-static and free of nonzero(), so the attention itself
+        # can be captured (see static_no_pack_cu in USPAttention).
+        out["txt_bucket_tail_cu"] = torch.tensor(
+            [int(raw_txt_lens[0])], dtype=torch.int32, device=ehs_tensor.device
+        )
+
     # the mask alone marks the valid text: a bucketed length would make the
     # eager forward of a missed graph attend the pad rows
     out["txt_seq_lens"] = None

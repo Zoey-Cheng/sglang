@@ -75,11 +75,14 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import get_compute_dtype
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
+
+logger = init_logger(__name__)
 
 _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.CUDNN_ATTENTION,
@@ -1072,6 +1075,54 @@ class USPAttention(nn.Module):
 
         if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
             attn_mask_meta = attn_mask_meta.resolve(attn_mask)
+
+        if (
+            isinstance(attn_mask_meta, dict)
+            and attn_mask_meta.get("static_no_pack_cu") is not None
+        ):
+            # Fixed-shape varlen: the sequence is [valid rows..., tail pad] and
+            # the pad is excluded by cu_seqlens VALUES, not by packing -- no
+            # gather/scatter, no nonzero, capturable into a CUDA graph. Padding
+            # rows receive garbage output; callers must drop them.
+            if attn_mask is not None:
+                raise ValueError("static_no_pack_cu excludes attn_mask")
+            if not (get_sequence_parallel_world_size() == 1 or effective_skip_sp):
+                raise NotImplementedError(
+                    "static_no_pack_cu is a single-rank path"
+                )
+            cu = attn_mask_meta["static_no_pack_cu"]
+            bs, seq = q.shape[0], q.shape[1]
+            if bs != 1:
+                raise NotImplementedError(
+                    "static_no_pack_cu supports batch size 1"
+                )
+            if self.causal:
+                raise NotImplementedError("static_no_pack_cu is a non-causal path")
+            if self.backend == AttentionBackendEnum.FA:
+                out = flash_attn_varlen_func(
+                    q=q.reshape(bs * seq, *q.shape[2:]),
+                    k=k.reshape(bs * seq, *k.shape[2:]),
+                    v=v.reshape(bs * seq, *v.shape[2:]),
+                    cu_seqlens_q=cu,
+                    cu_seqlens_k=cu,
+                    max_seqlen_q=bs * seq,
+                    max_seqlen_k=bs * seq,
+                    softmax_scale=self.softmax_scale,
+                    causal=False,
+                    ver=_fa_backend.fa_ver,
+                )
+                if isinstance(out, tuple):
+                    out = out[0]
+                return out.view(bs, seq, *out.shape[1:])
+            # Non-FA backends take their ordinary masked path with a [B, S]
+            # mask derived from the cu VALUE; arange < valid is shape-static,
+            # so SDPA-family capture still works and the shared SDPA fallback
+            # below applies its usual mask preparation.
+            attn_mask = (
+                torch.arange(seq, device=q.device, dtype=torch.int32)
+                < cu[1].to(torch.int32)
+            ).unsqueeze(0)
+            attn_mask_meta = None
 
         segmented_prefix = q_prefix is not None
         if segmented_prefix != (k_prefix is not None) or segmented_prefix != (
@@ -2472,21 +2523,55 @@ def _make_breakable_attention_forward(forward_method):
     @functools.wraps(forward_method)
     def forward(self, *args, **kwargs):
         if is_in_breakable_cuda_graph():
-            # Opt-in for model paths with fixed-shape dense attention. SP,
-            # varlen and other backends retain the normal eager break points.
-            capture_dense = (
+            # Opt-in for model paths with fixed-shape attention: dense (mask as
+            # a live graph input) or static no-pack varlen (pad clamped by
+            # cu_seqlens VALUES). SP, dynamic varlen and other backends retain
+            # the normal eager break points.
+            meta = kwargs.get("attn_mask_meta")
+            static_no_pack = (
+                isinstance(meta, dict) and meta.get("static_no_pack_cu") is not None
+            )
+            sdpa_family = (
+                AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.TORCH_CUDNN_SDPA,
+                AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
+            )
+            dense_capturable = (
                 getattr(self, "capture_dense_attention", False)
                 and get_sequence_parallel_world_size() == 1
                 and kwargs.get("seq_lens") is None
-                and kwargs.get("attn_mask_meta") is None
-                and self.backend
-                in (
-                    AttentionBackendEnum.TORCH_SDPA,
-                    AttentionBackendEnum.TORCH_CUDNN_SDPA,
-                    AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
+            )
+            if (
+                dense_capturable
+                and isinstance(meta, DynamicVarlenMaskMeta)
+                and self.backend in sdpa_family
+            ):
+                # SDPA-family backends ignore varlen metadata on the masked
+                # single-rank path but still pay its per-step resolve; dropping
+                # it here skips that cost and lets the dense mask capture.
+                kwargs["attn_mask_meta"] = None
+                meta = None
+            capture_dense = dense_capturable and (
+                (meta is None and self.backend in sdpa_family)
+                or (
+                    static_no_pack
+                    and self.backend in sdpa_family + (AttentionBackendEnum.FA,)
                 )
             )
             if not capture_dense:
+                if dense_capturable:
+                    # The model opted in but this backend/meta combination is
+                    # not capturable, so the graph silently keeps its break
+                    # points; say so once instead.
+                    logger.warning_once(
+                        "BCG: %s requested attention capture but backend %s "
+                        "cannot capture this input; the attention stays an "
+                        "eager break point. SDPA-family backends (e.g. "
+                        "--attention-backend torch_sdpa) capture the dense "
+                        "mask; FA captures only the static varlen route.",
+                        type(self).__name__,
+                        self.backend.name,
+                    )
                 return bcg_forward(self, *args, **kwargs)
         return forward_method(self, *args, **kwargs)
 
