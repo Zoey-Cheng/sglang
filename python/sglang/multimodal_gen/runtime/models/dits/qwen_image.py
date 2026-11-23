@@ -1206,16 +1206,17 @@ class QwenImageCrossAttention(nn.Module):
                 dim=1,
             )
 
-        # Under single-rank BCG on SDPA-family backends the dense joint tensors
-        # must be materialized: the captured dense attention cannot run the
-        # break point's segment packing. FA and multi-rank BCG keep the
-        # segmented break points.
+        # The attention takes a segmented prefix only on the local path, so
+        # sequence parallel always materializes the dense joint tensors -- in
+        # and out of a graph, since a missed signature reruns this eagerly.
+        # Single-rank SDPA materializes too: the captured dense attention
+        # cannot run the break point's segment packing.
         pack_from_segments = (
             attn_mask is not None
             and not sp_text_sharded
+            and get_sp_world_size() == 1
             and not (
                 is_in_breakable_cuda_graph()
-                and get_sp_world_size() == 1
                 and self.attn.backend
                 in (
                     AttentionBackendEnum.TORCH_SDPA,
