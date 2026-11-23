@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import (
     BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
     BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
@@ -89,6 +90,7 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
         self.stage.transformer = OtherTransformer2DModel()
         self.stage.transformer_2 = None
         self.stage._mounted_quality = "exact"
+        self.stage._attention_backend_active_override = None
 
     @staticmethod
     def _batch(quality: str):
@@ -127,6 +129,34 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
 
         self.assertIsNot(exact_runner, default_runner)
         self.assertEqual(len(built), 2)
+
+    def test_a_backend_override_gets_its_own_bcg_runner(self):
+        # Capturing the attention bakes in the backend it recorded with, so a
+        # request that asks for another one must not reach the warmup graphs;
+        # it gets an empty runner and runs eager on the backend it asked for.
+        self.stage._bcg_runners = {}
+        self.stage._mounted_quality = "lossless"
+        model = self.stage.transformer
+
+        class _FakeRunner:
+            def __init__(self, transformer, device):
+                pass
+
+        with (
+            patch.object(
+                denoising_module, "get_local_torch_device", return_value="cpu"
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.breakable_cuda_graph.runner."
+                "DiffusionBreakableCudaGraphRunner",
+                _FakeRunner,
+            ),
+        ):
+            default_runner = self.stage._maybe_get_bcg_runner(model)
+            self.stage._attention_backend_active_override = AttentionBackendEnum.FA
+            override_runner = self.stage._maybe_get_bcg_runner(model)
+
+        self.assertIsNot(override_runner, default_runner)
 
     def test_mounting_a_fusion_under_bcg_is_allowed(self):
         # This used to raise: with one runner per module, switching level
@@ -261,6 +291,7 @@ def _fake_cache_dit_batch(*, is_warmup: bool) -> SimpleNamespace:
 class TestDiffusionBCGPadding(unittest.TestCase):
     def setUp(self):
         self.stage = DenoisingStage.__new__(DenoisingStage)
+        self.stage._attention_backend_active_override = None
         self.qwen_model = QwenImageTransformer2DModel()
         self.qwen21_model = QwenImage21Transformer2DModel()
         self.ideogram_model = Ideogram4Transformer2DModel()
@@ -721,9 +752,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
     def test_ideogram_batched_rows_keep_the_mask_route(self):
         kwargs = self._ideogram_kwargs(19)
         for key in ("llm_features", "x", "position_ids", "segment_ids", "indicator"):
-            kwargs[key] = kwargs[key].repeat(
-                2, *([1] * (kwargs[key].dim() - 1))
-            )
+            kwargs[key] = kwargs[key].repeat(2, *([1] * (kwargs[key].dim() - 1)))
         kwargs["attn_mask"] = kwargs["segment_ids"] > 0
         with self._patch_buckets(64, 128):
             out = self.stage._bcg_pad_prompt_kwargs(

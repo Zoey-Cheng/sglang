@@ -50,8 +50,10 @@ class TestStaticNoPackVarlen(unittest.TestCase):
             return torch.zeros(seq, heads, dim)
 
         ctx, sp = _single_rank_patches()
-        with ctx, sp, patch(
-            f"{_LAYER}.flash_attn_varlen_func", side_effect=fake_varlen
+        with (
+            ctx,
+            sp,
+            patch(f"{_LAYER}.flash_attn_varlen_func", side_effect=fake_varlen),
         ):
             out = obj.forward(q, q, q, attn_mask_meta={"static_no_pack_cu": cu})
 
@@ -147,9 +149,7 @@ class TestBCGCaptureRouting(unittest.TestCase):
         self.assertEqual(seen["where"], "break")
 
     def test_module_without_opt_in_keeps_the_break(self):
-        seen = self._route(
-            AttentionBackendEnum.TORCH_SDPA, meta=None, opted_in=False
-        )
+        seen = self._route(AttentionBackendEnum.TORCH_SDPA, meta=None, opted_in=False)
         self.assertEqual(seen["where"], "break")
 
 

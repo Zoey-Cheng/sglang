@@ -2614,7 +2614,14 @@ class DenoisingStage(PipelineStage):
         # finds an empty runner and the eager fallback runs the fusion set it
         # actually asked for. Sharing one runner would replay the warmup
         # level's kernels under a different level's name.
-        key = (id(current_model), self._mounted_quality)
+        # A captured graph also bakes in the attention backend it recorded
+        # with, so a request that overrides the backend needs its own runner
+        # and runs eager rather than replaying the warmup level's kernels.
+        key = (
+            id(current_model),
+            self._mounted_quality,
+            self._attention_backend_active_override,
+        )
         runner = self._bcg_runners.get(key)
         if runner is None:
             from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
@@ -2624,7 +2631,7 @@ class DenoisingStage(PipelineStage):
             # Another level already has a runner, so this one arrived after
             # warmup and will never hold a captured graph.
             served_another_level = any(
-                model_id == id(current_model) for model_id, _ in self._bcg_runners
+                model_id == id(current_model) for model_id, *_ in self._bcg_runners
             )
             # DenoisingStage can switch between transformer and transformer_2;
             # each module owns separate graph state and static input buffers.

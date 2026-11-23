@@ -1087,15 +1087,11 @@ class USPAttention(nn.Module):
             if attn_mask is not None:
                 raise ValueError("static_no_pack_cu excludes attn_mask")
             if not (get_sequence_parallel_world_size() == 1 or effective_skip_sp):
-                raise NotImplementedError(
-                    "static_no_pack_cu is a single-rank path"
-                )
+                raise NotImplementedError("static_no_pack_cu is a single-rank path")
             cu = attn_mask_meta["static_no_pack_cu"]
             bs, seq = q.shape[0], q.shape[1]
             if bs != 1:
-                raise NotImplementedError(
-                    "static_no_pack_cu supports batch size 1"
-                )
+                raise NotImplementedError("static_no_pack_cu supports batch size 1")
             if self.causal:
                 raise NotImplementedError("static_no_pack_cu is a non-causal path")
             if self.backend == AttentionBackendEnum.FA:
