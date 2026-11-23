@@ -22,6 +22,7 @@ from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfi
 from sglang.multimodal_gen.configs.models.fsdp import is_layer
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
+    get_sp_world_size,
     get_tp_world_size,
     model_parallel_is_initialized,
 )
@@ -57,6 +58,9 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 _is_cuda = current_platform.is_cuda()
 
@@ -297,6 +301,7 @@ class Ideogram4Attention(nn.Module):
             softmax_scale=None,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+            capture_dense_attention=True,
         )
         self.o = _row_linear(
             hidden_size,
@@ -713,6 +718,7 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         llm_cond: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
         attn_mask_meta: dict | None = None,
+        joint_tail_cu: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         # llm_cond: project_llm_features output, which callers may compute once
@@ -739,10 +745,26 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         cos = cos.unsqueeze(2)
         sin = sin.unsqueeze(2)
         # ideogram uses -1 padding; varlen meta enables fa packed attention
-        if attn_mask is None:
-            attn_mask = segment_ids > 0
-        if attn_mask_meta is None:
-            attn_mask_meta = build_varlen_mask_meta(attn_mask)
+        if (
+            joint_tail_cu is not None
+            and is_in_breakable_cuda_graph()
+            and get_sp_world_size() == 1
+        ):
+            # The BCG padder vouched for one contiguous valid prefix, so the
+            # pad is a tail that cu_seqlens VALUES clamp: no mask, no nonzero,
+            # every shape static. Pad rows come back as garbage and are
+            # dropped with the rest of the non-image rows by the caller.
+            # The route is single-rank; sequence parallel keeps the mask.
+            cu = joint_tail_cu.to(torch.int32)
+            attn_mask = None
+            attn_mask_meta = {
+                "static_no_pack_cu": torch.cat([torch.zeros_like(cu), cu]).contiguous()
+            }
+        else:
+            if attn_mask is None:
+                attn_mask = segment_ids > 0
+            if attn_mask_meta is None:
+                attn_mask_meta = build_varlen_mask_meta(attn_mask)
         for layer in self.layers:
             h = layer(
                 h,

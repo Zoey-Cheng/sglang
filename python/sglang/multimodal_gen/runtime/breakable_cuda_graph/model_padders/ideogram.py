@@ -114,6 +114,23 @@ def pad_ideogram_prompt_kwargs(
                 out["attn_mask"], source=source_total, target=target_total
             )
 
+    if (
+        indicator.shape[0] == 1
+        # A row that starts on an LLM token carries no leading pad, so the
+        # stage's segment_ids mark one contiguous valid prefix that a single
+        # cu value describes. Batched rows are left-padded to the longest
+        # prompt and keep interior holes the value cannot express.
+        and int(indicator[0, 0].item()) == _LLM_TOKEN_INDICATOR
+    ):
+        # Carry the valid joint length as a device VALUE: the forward then
+        # stays shape-static and needs no nonzero()-based metadata, so the
+        # attention itself can be captured (see static_no_pack_cu).
+        out["joint_tail_cu"] = torch.tensor(
+            [source_total], dtype=torch.int32, device=indicator.device
+        )
+        # The mask stays alongside it: the forward ignores it on the cu route,
+        # and sequence parallel still needs it to reach the masked path.
+
     if out.get("attn_mask") is not None:
         out["attn_mask_meta"] = _dynamic_mask_meta(current_model)
 

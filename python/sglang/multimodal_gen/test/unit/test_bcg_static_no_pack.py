@@ -6,7 +6,11 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention import layer as layer_module
+from sglang.multimodal_gen.runtime.layers.attention.layer import (
+    DynamicVarlenMaskMeta,
+    USPAttention,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 _LAYER = "sglang.multimodal_gen.runtime.layers.attention.layer"
@@ -92,6 +96,61 @@ class TestStaticNoPackVarlen(unittest.TestCase):
                     "static_no_pack_cu": torch.tensor([0, 4], dtype=torch.int32)
                 },
             )
+
+
+class TestBCGCaptureRouting(unittest.TestCase):
+    """Which (backend, metadata) pairs the BCG wrapper holds inside the graph.
+
+    A pair routed the wrong way either bakes a content-dependent shape into
+    the graph or sends a capturable path back to per-layer eager breaks.
+    """
+
+    def _route(self, backend, *, meta, opted_in=True, sp_size=1):
+        seen = {}
+
+        def capture_path(self, **kwargs):
+            seen.update(where="capture", meta=kwargs.get("attn_mask_meta"))
+
+        def break_path(self, **kwargs):
+            seen.update(where="break", meta=kwargs.get("attn_mask_meta"))
+
+        with patch(f"{_LAYER}.eager_on_graph", return_value=break_path):
+            forward = layer_module._make_breakable_attention_forward(capture_path)
+        module = SimpleNamespace(backend=backend, capture_dense_attention=opted_in)
+        with (
+            patch(f"{_LAYER}.is_in_breakable_cuda_graph", return_value=True),
+            patch(f"{_LAYER}.get_sequence_parallel_world_size", return_value=sp_size),
+        ):
+            forward(module, attn_mask_meta=meta)
+        return seen
+
+    def test_sdpa_drops_dynamic_meta_and_captures(self):
+        seen = self._route(
+            AttentionBackendEnum.TORCH_SDPA, meta=DynamicVarlenMaskMeta()
+        )
+        self.assertEqual(seen["where"], "capture")
+        self.assertIsNone(seen["meta"])
+
+    def test_fa_captures_the_static_route(self):
+        cu = torch.tensor([0, 4], dtype=torch.int32)
+        seen = self._route(AttentionBackendEnum.FA, meta={"static_no_pack_cu": cu})
+        self.assertEqual(seen["where"], "capture")
+
+    def test_fa_keeps_the_break_and_the_meta_on_dynamic_varlen(self):
+        meta = DynamicVarlenMaskMeta()
+        seen = self._route(AttentionBackendEnum.FA, meta=meta)
+        self.assertEqual(seen["where"], "break")
+        self.assertIs(seen["meta"], meta)
+
+    def test_sequence_parallel_keeps_the_break(self):
+        seen = self._route(AttentionBackendEnum.TORCH_SDPA, meta=None, sp_size=2)
+        self.assertEqual(seen["where"], "break")
+
+    def test_module_without_opt_in_keeps_the_break(self):
+        seen = self._route(
+            AttentionBackendEnum.TORCH_SDPA, meta=None, opted_in=False
+        )
+        self.assertEqual(seen["where"], "break")
 
 
 if __name__ == "__main__":

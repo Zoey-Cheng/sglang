@@ -381,6 +381,9 @@ class ZImageAttention(nn.Module):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            # The BCG padder captures at native lengths, so a single request
+            # carries no attention mask and the shapes are already static.
+            capture_dense_attention=True,
         )
 
         self.rotary_emb = RotaryEmbedding(

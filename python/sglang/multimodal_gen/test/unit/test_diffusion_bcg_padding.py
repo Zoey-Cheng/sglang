@@ -710,10 +710,41 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(short["x"].shape, (1, 68, 16))
         self.assertEqual(short["position_ids"].shape, (1, 68, 3))
         self.assertEqual(short["segment_ids"][0, 23:].tolist(), [-1] * 45)
-        self.assertFalse(short["attn_mask"][0, 23:].any())
+        # The valid joint length travels as a VALUE, so the two prompts keep
+        # one signature while the attention still sees its own boundary.
+        self.assertEqual(short["joint_tail_cu"].tolist(), [23])
+        self.assertEqual(longer["joint_tail_cu"].tolist(), [51])
+        # The mask rides along for the sequence-parallel fallback.
         self.assertIsInstance(short["attn_mask_meta"], DynamicVarlenMaskMeta)
-        self.assertIs(short["attn_mask_meta"], longer["attn_mask_meta"])
         self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
+
+    def test_ideogram_batched_rows_keep_the_mask_route(self):
+        kwargs = self._ideogram_kwargs(19)
+        for key in ("llm_features", "x", "position_ids", "segment_ids", "indicator"):
+            kwargs[key] = kwargs[key].repeat(
+                2, *([1] * (kwargs[key].dim() - 1))
+            )
+        kwargs["attn_mask"] = kwargs["segment_ids"] > 0
+        with self._patch_buckets(64, 128):
+            out = self.stage._bcg_pad_prompt_kwargs(
+                kwargs, current_model=self.ideogram_model
+            )
+
+        self.assertNotIn("joint_tail_cu", out)
+        self.assertIsInstance(out["attn_mask_meta"], DynamicVarlenMaskMeta)
+
+    def test_ideogram_leading_pad_keeps_the_mask_route(self):
+        # A row the stage left-padded to the batch maximum starts on a pad
+        # token, so its valid span is not a prefix a single cu can describe.
+        kwargs = self._ideogram_kwargs(19)
+        kwargs["indicator"][0, 0] = 0
+        with self._patch_buckets(64, 128):
+            out = self.stage._bcg_pad_prompt_kwargs(
+                kwargs, current_model=self.ideogram_model
+            )
+
+        self.assertNotIn("joint_tail_cu", out)
+        self.assertIsInstance(out["attn_mask_meta"], DynamicVarlenMaskMeta)
 
     def test_ideogram_image_only_kwargs_are_not_prompt_padded(self):
         kwargs = self._ideogram_kwargs(0)
